@@ -14,7 +14,7 @@ import {
   Animated,
 } from 'react-native';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
-import ReanimatedAnimated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import ReanimatedAnimated, { Easing, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 import { BlurView } from 'expo-blur';
 import { database, auth, firestore } from '@/config/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -326,7 +326,7 @@ export default function Dashboard() {
   const [trackWidth, setTrackWidth] = useState(0);
   const THUMB_SIZE = 48;
   const SLIDE_RANGE = Math.max(0, trackWidth - THUMB_SIZE - 8);
-  const SLIDE_THRESHOLD = SLIDE_RANGE * 0.6;
+  const SLIDE_THRESHOLD = SLIDE_RANGE * 0.5;
   const onlineRef = useRef(false);
   const isDraggingRef = useRef(false);
   const localTransitionRef = useRef(false);
@@ -336,7 +336,10 @@ export default function Dashboard() {
     transform: [{ translateX: sliderX.value }],
   }));
   const animateSlider = (online: boolean) => {
-    sliderX.value = withSpring(online ? SLIDE_RANGE : 0);
+    sliderX.value = withTiming(online ? SLIDE_RANGE : 0, {
+      duration: 180,
+      easing: Easing.out(Easing.cubic),
+    });
   };
 
   // Panel animation for draggable bottom sheet (panel slides behind nav bar)
@@ -484,7 +487,10 @@ export default function Dashboard() {
       return;
     }
 
-    sliderX.value = withSpring(target);
+    sliderX.value = withTiming(target, {
+      duration: 180,
+      easing: Easing.out(Easing.cubic),
+    });
   }, [trackWidth, isOnline]);
 
   useEffect(() => {
@@ -838,21 +844,28 @@ export default function Dashboard() {
 
   const startX = useRef(0);
   const savedTranslateX = useRef(0);
+  const savedOnlineRef = useRef(false);
 
   const handleToggleEnd = async (nextOnline: boolean) => {
     isDraggingRef.current = false;
-    if (nextOnline === onlineRef.current) {
-      animateSlider(onlineRef.current);
+    const previousOnline = onlineRef.current;
+    if (nextOnline === previousOnline) {
+      animateSlider(previousOnline);
       return;
     }
     if (!nextOnline && (isBusy || hasActiveTrip)) {
       setToastData({ clientName: 'Notice', message: 'Finish your trip first' });
       setShowToast(true);
-      animateSlider(onlineRef.current);
+      animateSlider(previousOnline);
       return;
     }
+
     localTransitionRef.current = true;
     localChangeUntilRef.current = Date.now() + 1500;
+    onlineRef.current = nextOnline;
+    setIsOnline(nextOnline);
+    animateSlider(nextOnline);
+
     try {
       if (nextOnline) await goOnline();
       else await goOffline();
@@ -860,8 +873,9 @@ export default function Dashboard() {
       console.log('[v0] Toggle transition failed:', error);
       setToastData({ clientName: 'Notice', message: 'Unable to change your online status' });
       setShowToast(true);
-      onlineRef.current = false;
-      setIsOnline(false);
+      onlineRef.current = previousOnline;
+      setIsOnline(previousOnline);
+      animateSlider(previousOnline);
     } finally {
       localTransitionRef.current = false;
       animateSlider(onlineRef.current);
@@ -875,7 +889,8 @@ export default function Dashboard() {
     .failOffsetY([-15, 15])
     .onStart(() => {
       isDraggingRef.current = true;
-      savedTranslateX.current = onlineRef.current ? SLIDE_RANGE : 0;
+      savedOnlineRef.current = onlineRef.current;
+      savedTranslateX.current = savedOnlineRef.current ? SLIDE_RANGE : 0;
     })
     .onUpdate((event) => {
       sliderX.value = Math.max(0, Math.min(savedTranslateX.current + event.translationX, SLIDE_RANGE));
@@ -886,12 +901,21 @@ export default function Dashboard() {
         isDraggingRef.current = false;
         return;
       }
-      const finalPosition = Math.max(0, Math.min(SLIDE_RANGE, savedTranslateX.current + event.translationX + event.velocityX * 0.1));
-      handleToggleEnd(finalPosition >= SLIDE_THRESHOLD);
+      const startedOnline = savedOnlineRef.current;
+      const dragDistance = Math.max(0, startedOnline ? -event.translationX : event.translationX);
+      const velocityTowardTarget = startedOnline ? -event.velocityX : event.velocityX;
+      const velocityAssist = dragDistance >= SLIDE_RANGE * 0.3 && velocityTowardTarget > 0
+        ? velocityTowardTarget * 0.1
+        : 0;
+      const shouldSwitch = SLIDE_RANGE > 0 && dragDistance + velocityAssist >= SLIDE_THRESHOLD;
+      handleToggleEnd(shouldSwitch ? !startedOnline : startedOnline);
     });
 
   // Panel drag gesture for bottom sheet
   const panelGesture = Gesture.Pan()
+    .activeOffsetY([-10, 10])
+    .failOffsetX([-15, 15])
+    .simultaneousWithExternalGesture(gesture)
     .onStart(() => {
       savedPanelY.current = panelYRef.current;
     })
