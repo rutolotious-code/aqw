@@ -142,7 +142,7 @@ import { distanceMeters, bearingDegrees } from '@/utils/geo';
 import { set as setLocation } from '@/utils/locationStore';
 import { getUnreadCount, listenForClientMessages, autoDeleteReadMessages, watchRideStatusForCleanup } from '@/utils/chat';
 import TripsHistory from '@/components/TripsHistory';
-import { useDriverTripHistory } from '@/hooks/useDriverTripHistory';
+import { useTodayEarnings } from '@/hooks/useDriverTripHistory';
 import DriverSettings from '@/components/DriverSettings';
 import BottomNav from '@/components/BottomNav';
 
@@ -202,7 +202,7 @@ export default function Dashboard() {
   const { activeTrip, liveOrder, driverStatus, storeCallable, tripStatus, workflowType, markers, activePolyline, showPolyline, arrivalTime } =
   useActiveTrip(driverId, activeOrder);
   const { callState, formattedTime, startCall } = useCall();
-  const { totalEarnings, loading: tripHistoryLoading } = useDriverTripHistory(driverId, 'today');
+  const { totalEarnings, loading: earningsLoading } = useTodayEarnings(driverId);
 
   const callPulse = useRef(new Animated.Value(1)).current;
 
@@ -1167,7 +1167,7 @@ if (activeTab === 'settings') {
               <View style={styles.statHeader}>
                 <Text style={styles.statLabel}>Today&apos;s{'\n'}earnings</Text>
               </View>
-              {tripHistoryLoading || !driverId ? (
+              {earningsLoading || !driverId ? (
                 <View style={styles.statSkeleton} />
               ) : (
                 <Text style={styles.statValue}>ZMW {totalEarnings.toFixed(2)}</Text>
