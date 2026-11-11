@@ -49,7 +49,36 @@ const getLocation = async () => {
   }
 };
 
+const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation');
+
 const watchLocation = async (callback: (coords: { latitude: number; longitude: number; heading: number; speed: number; accuracy: number }) => void) => {
+  if (isNative()) {
+    const id = await BackgroundGeolocation.addWatcher(
+      {
+        backgroundMessage: 'Tracking your location while you are online',
+        backgroundTitle: 'Aletwende Driver',
+        requestPermissions: true,
+        stale: false,
+        distanceFilter: 10,
+      },
+      (location, error) => {
+        if (error) {
+          console.log('[v0] Background location error:', error.message);
+          return;
+        }
+        if (!location) return;
+        callback({
+          latitude: location.latitude,
+          longitude: location.longitude,
+          heading: location.bearing ?? 0,
+          speed: location.speed ?? 0,
+          accuracy: location.accuracy ?? Infinity,
+        });
+      }
+    );
+    return { remove: () => BackgroundGeolocation.removeWatcher({ id }) };
+  }
+
   if (Platform.OS !== 'web') {
     const Location = await import('expo-location');
     const { status } = await Location.requestForegroundPermissionsAsync();
@@ -61,8 +90,8 @@ const watchLocation = async (callback: (coords: { latitude: number; longitude: n
     return await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.High,
-        timeInterval: 3000, // Update every 3 seconds
-        distanceInterval: 15, // Or every 15 meters
+        timeInterval: 3000,
+        distanceInterval: 15,
       },
       (loc) => {
         callback({
@@ -74,25 +103,28 @@ const watchLocation = async (callback: (coords: { latitude: number; longitude: n
         });
       }
     );
-  } else {
-    if (!navigator.geolocation) return null;
-    const watchId = navigator.geolocation.watchPosition(
-      (pos) => callback({
-        latitude: pos.coords.latitude,
-        longitude: pos.coords.longitude,
-        heading: pos.coords.heading || 0,
-        speed: pos.coords.speed || 0,
-        accuracy: pos.coords.accuracy ?? Infinity,
-      }),
-      (error) => {
-        console.log('[v0] Location error:', error.message);
-      },
-      { enableHighAccuracy: true }
-    );
-    return { remove: () => navigator.geolocation.clearWatch(watchId) };
   }
+
+  if (!navigator.geolocation) return null;
+  const watchId = navigator.geolocation.watchPosition(
+    (pos) => callback({
+      latitude: pos.coords.latitude,
+      longitude: pos.coords.longitude,
+      heading: pos.coords.heading || 0,
+      speed: pos.coords.speed || 0,
+      accuracy: pos.coords.accuracy ?? Infinity,
+    }),
+    (error) => {
+      console.log('[v0] Location error:', error.message);
+    },
+    { enableHighAccuracy: true }
+  );
+  return { remove: () => navigator.geolocation.clearWatch(watchId) };
 };
 import { ref, update, onValue, off, remove, set } from 'firebase/database';
+import { registerPlugin } from '@capacitor/core';
+import type { BackgroundGeolocationPlugin } from '@capacitor-community/background-geolocation';
+import { isNative } from '@/utils/nativeCalls';
 import { clearDriverPresence } from '@/utils/driverPresence';
 import { Home, Mail, Clock, Settings, Phone } from 'lucide-react-native';
 import { useCall } from '@/context/CallContext';
@@ -126,6 +158,10 @@ export default function Dashboard() {
   const [locationSubscription, setLocationSubscription] = useState<any>(null);
   const locationSubscriptionRef = useRef<any>(null);
   const trackingStartRef = useRef<Promise<void> | null>(null);
+  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const latestLocationRef = useRef<{ latitude: number; longitude: number; heading: number } | null>(null);
+  const trackingUidRef = useRef<string | null>(null);
+  const stopTrackingRef = useRef<(() => Promise<void>) | null>(null);
   const [locationPermissionDenied, setLocationPermissionDenied] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('home');
@@ -147,7 +183,12 @@ export default function Dashboard() {
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-      if (!user) router.replace('/');
+      if (!user) {
+        onlineRef.current = false;
+        setIsOnline(false);
+        void stopTrackingRef.current?.();
+        router.replace('/');
+      }
     });
     return unsubscribe;
   }, [router]);
@@ -530,9 +571,35 @@ export default function Dashboard() {
     setShowInboxPanel(true);
   };
 
+  const writeDriverLocation = async (uid: string, latitude: number, longitude: number) => {
+    const geoObject = createGeoFireObject(latitude, longitude);
+    await set(ref(database, `driver_locations/${uid}`), {
+      l: geoObject.l,
+      g: geoObject.g,
+      t: Date.now(),
+      sessionId: sessionIdRef.current,
+    });
+  };
+
+  const startLocationHeartbeat = (uid: string) => {
+    if (heartbeatIntervalRef.current || !onlineRef.current) return;
+    heartbeatIntervalRef.current = setInterval(() => {
+      const latest = latestLocationRef.current;
+      if (!onlineRef.current || !latest) return;
+      void writeDriverLocation(uid, latest.latitude, latest.longitude).catch((error) => {
+        console.log('[v0] Location heartbeat write failed:', error);
+      });
+    }, 10_000);
+  };
+
   const startTracking = async () => {
     const uid = auth.currentUser?.uid;
-    if (!uid || !isOnline || locationSubscriptionRef.current) return;
+    if (!uid || !onlineRef.current) return;
+    if (locationSubscriptionRef.current) {
+      trackingUidRef.current = uid;
+      startLocationHeartbeat(uid);
+      return;
+    }
     if (trackingStartRef.current) return trackingStartRef.current;
 
     trackingStartRef.current = (async () => {
@@ -557,24 +624,20 @@ export default function Dashboard() {
         }
         if (distance >= 5) lastAcceptedPositionRef.current = { latitude, longitude };
         stableHeadingRef.current = nextHeading;
+        latestLocationRef.current = { latitude, longitude, heading: stableHeadingRef.current };
 
         setCurrentLocation({ latitude, longitude });
         setLocationPermissionDenied(false);
         setVehiclePosition({ lat: latitude, lng: longitude, heading: stableHeadingRef.current });
         setLocation(latitude, longitude, stableHeadingRef.current, Date.now());
 
-        const geoObject = createGeoFireObject(latitude, longitude);
-        if (Date.now() - lastLocationWriteRef.current < 3000) return;
-        lastLocationWriteRef.current = Date.now();
-        await set(ref(database, `driver_locations/${uid}`), {
-          l: geoObject.l,
-          g: geoObject.g,
-          t: Date.now(),
-          sessionId: sessionIdRef.current,
-        });
+        if (Date.now() - lastLocationWriteRef.current >= 3000) {
+          lastLocationWriteRef.current = Date.now();
+          await writeDriverLocation(uid, latitude, longitude);
+        }
 
-  const rideId = activeRideIdRef.current;
-  const rideStatus = activeRideStatusRef.current;
+        const rideId = activeRideIdRef.current;
+        const rideStatus = activeRideStatusRef.current;
         if (rideId && rideStatus && ['accepted', 'arrived', 'started', 'at_store', 'picked_up'].includes(rideStatus)) {
           try {
             const orderRef = doc(firestore, 'orders', rideId);
@@ -591,8 +654,10 @@ export default function Dashboard() {
         setLocationPermissionDenied(true);
         return;
       }
+      trackingUidRef.current = uid;
       locationSubscriptionRef.current = subscription;
       setLocationSubscription(subscription);
+      startLocationHeartbeat(uid);
     })();
 
     try {
@@ -603,7 +668,11 @@ export default function Dashboard() {
   };
 
   const stopTracking = async () => {
-    const uid = auth.currentUser?.uid;
+    const uid = auth.currentUser?.uid ?? trackingUidRef.current;
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
     const subscription = locationSubscriptionRef.current;
     locationSubscriptionRef.current = null;
     setLocationSubscription(null);
@@ -616,8 +685,18 @@ export default function Dashboard() {
       }
     }
 
-    if (uid) await remove(ref(database, `driver_locations/${uid}`));
+    trackingUidRef.current = null;
+    latestLocationRef.current = null;
+    if (uid) {
+      try {
+        await remove(ref(database, `driver_locations/${uid}`));
+      } catch (error) {
+        console.log('[v0] Error removing driver location:', error);
+      }
+    }
   };
+
+  stopTrackingRef.current = stopTracking;
 
   useEffect(() => {
     if (!auth.currentUser?.uid || userStatus !== 'approved' || !isOnline) {
@@ -639,14 +718,23 @@ export default function Dashboard() {
           const lastKnown = await Location.getLastKnownPositionAsync({});
           const position = lastKnown || await Location.getCurrentPositionAsync({});
           if (!cancelled && position) {
-            setVehiclePosition({ lat: position.coords.latitude, lng: position.coords.longitude, heading: position.coords.heading || 0 });
+            const { latitude, longitude } = position.coords;
+            const heading = position.coords.heading || 0;
+            latestLocationRef.current = { latitude, longitude, heading };
+            setCurrentLocation({ latitude, longitude });
+            setVehiclePosition({ lat: latitude, lng: longitude, heading });
           }
         } catch (error) {
           setLocationPermissionDenied(true);
         }
       } else {
         const position = await getLocation();
-        if (!cancelled && position) setVehiclePosition({ lat: position.latitude, lng: position.longitude, heading: position.heading || 0 });
+        if (!cancelled && position) {
+          const heading = position.heading || 0;
+          latestLocationRef.current = { latitude: position.latitude, longitude: position.longitude, heading };
+          setCurrentLocation({ latitude: position.latitude, longitude: position.longitude });
+          setVehiclePosition({ lat: position.latitude, lng: position.longitude, heading });
+        }
       }
       if (!cancelled && isOnline) await startTracking();
     };
@@ -705,7 +793,10 @@ export default function Dashboard() {
 
     if (coords) {
       const { latitude, longitude } = coords;
-      setVehiclePosition({ lat: latitude, lng: longitude, heading: (coords as any).heading || 0 });
+      const heading = (coords as any).heading || 0;
+      latestLocationRef.current = { latitude, longitude, heading };
+      setCurrentLocation({ latitude, longitude });
+      setVehiclePosition({ lat: latitude, lng: longitude, heading });
       // Update driver_locations/{uid} with GeoFire format
       const geoObject = createGeoFireObject(latitude, longitude);
       await set(ref(database, `driver_locations/${uid}`), {
