@@ -78,6 +78,7 @@ function buildStopMarkers(order: any): MarkerDef[] {
 function orderToTrip(order: any) {
   if (!order) return null;
   return {
+    ...order,
     orderId: order.orderId ?? order.id,
   workflowType: normalizeWorkflow(order.workflowType),
   requestType: normalizeWorkflow(order.workflowType),
@@ -98,7 +99,6 @@ function orderToTrip(order: any) {
     total: order.total ?? order.fare,
     fee: order.fee,
     data: order,
-    ...order,
   };
 }
 
