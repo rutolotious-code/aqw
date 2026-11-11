@@ -11,6 +11,7 @@ import { TripRequestProvider } from '@/context/IncomingRidesContext';
 import GlobalTripRequestPanel from '@/components/GlobalTripRequestPanel';
 import { CallProvider } from '@/context/CallContext';
 import CallOverlay from '@/components/CallOverlay';
+import NativeCallsBoot from '@/components/NativeCallsBoot';
 import { auth, firestore } from '@/config/firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { doc, onSnapshot } from 'firebase/firestore';
@@ -173,6 +174,7 @@ export default function RootLayout() {
           {isAuthenticated && verificationStatus === 'approved' && pathname === '/dashboard' && (
             <GlobalTripRequestPanel />
           )}
+          <NativeCallsBoot />
           <CallOverlay />
           <StatusBar style="light" />
           </CallProvider>

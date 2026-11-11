@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@capacitor/core": "^8.0.0",
     "@expo/vector-icons": "^15.0.3",
     "@lucide/lab": "^0.1.2",
     "@mapbox/polyline": "^1.2.1",
