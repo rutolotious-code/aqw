@@ -9,6 +9,7 @@ import {
   PanResponder,
   Platform,
   ActivityIndicator,
+  Alert,
   ScrollView,
 } from 'react-native';
 import { User, MapPin, Navigation, Hash, Phone, Package, Car, Truck, CheckCircle2 } from 'lucide-react-native';
@@ -169,6 +170,8 @@ export default function GlobalTripRequestPanel() {
   const [isAccepting, setIsAccepting] = useState(false);
   const [isRejecting, setIsRejecting] = useState(false);
   const [isActionLoading, setIsActionLoading] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const actionErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
 
   // Fare summary shown to the driver once a trip is fully complete.
@@ -179,6 +182,18 @@ export default function GlobalTripRequestPanel() {
     workflowType: TripRequest['workflowType'];
   } | null>(null);
   const pendingEarning = pendingEarnings[0] ?? null;
+  const showActionError = useCallback((message: string) => {
+    if (actionErrorTimer.current) clearTimeout(actionErrorTimer.current);
+    setActionError(message);
+    actionErrorTimer.current = setTimeout(() => {
+      setActionError(null);
+      actionErrorTimer.current = null;
+    }, 4000);
+  }, []);
+
+  useEffect(() => () => {
+    if (actionErrorTimer.current) clearTimeout(actionErrorTimer.current);
+  }, []);
 
   // Animation value for panel position
   const panelY = useRef(new Animated.Value(PANEL_MINIMIZED_Y)).current;
@@ -417,11 +432,19 @@ export default function GlobalTripRequestPanel() {
 
   // CENTRALIZED status update handler - ALL buttons use this same pattern
   // Matches the ACCEPT button behavior which is already working correctly
-  const updateTripStatus = async (status: string) => {
-    const uid = auth.currentUser?.uid;
-    if (!uid || !currentRequest) return;
+  const updateTripStatus = async (status: string, confirmEarlyComplete = false) => {
+    const user = auth.currentUser;
+    const uid = user?.uid;
+    if (!currentRequest) return;
+    if (!user || !uid) {
+      showActionError('Session expired, please sign in again');
+      return;
+    }
 
-    // Set appropriate loading state based on status
+    if (actionErrorTimer.current) clearTimeout(actionErrorTimer.current);
+    actionErrorTimer.current = null;
+    setActionError(null);
+
     if (status === 'accepted') {
       setIsAccepting(true);
     } else if (status === 'declined') {
@@ -431,21 +454,72 @@ export default function GlobalTripRequestPanel() {
     }
 
     try {
+      let token: string | undefined;
+      try {
+        token = await user.getIdToken();
+      } catch {
+        token = undefined;
+      }
+      if (!token) {
+        showActionError('Session expired, please sign in again');
+        return;
+      }
+
       const response = await fetch(`${API_BASE}/updateTripStatus`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           orderId: currentRequest.orderId,
           driverId: uid,
-          status: status,
+          status,
+          ...(confirmEarlyComplete ? { confirmEarlyComplete: true } : {}),
         }),
       });
-
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        throw new Error(data.error || `Failed to update status to ${status}`);
+        if (response.status === 401) {
+          showActionError('Session expired, please sign in again');
+          return;
+        }
+
+        if (
+          data.code === 'TOO_FAR' &&
+          status === 'completed' &&
+          normalizeWorkflow(currentRequest.workflowType) === 'direct_trip' &&
+          !confirmEarlyComplete
+        ) {
+          const message = 'You are far from the destination. Complete anyway?';
+          const retryWithConfirmation = () => {
+            setTimeout(() => void updateTripStatus(status, true), 0);
+          };
+          if (Platform.OS === 'web') {
+            if (typeof window !== 'undefined' && window.confirm(message)) retryWithConfirmation();
+          } else {
+            Alert.alert('Confirm completion', message, [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Complete anyway', onPress: retryWithConfirmation },
+            ]);
+          }
+          return;
+        }
+
+        const message =
+          data.code === 'TOO_FAR'
+            ? `You are ${data.distanceM} m away. Get within ${data.requiredM} m to continue.`
+            : data.code === 'LOCATION_STALE'
+              ? 'Waiting for a fresh GPS location. Move a little and try again.'
+              : data.code === 'INVALID_TRANSITION'
+                ? "That step isn't available right now."
+                : data.code === 'NOT_YOUR_ORDER'
+                  ? 'This trip is no longer assigned to you.'
+                  : typeof data.error === 'string'
+                    ? data.error
+                    : `Failed to update status to ${status}`;
+        showActionError(message);
+        return;
       }
+
       // On successful completion, show the fare summary instead of letting the
       // panel silently disappear. Capture the trip data now since the RTDB
       // listener will clear currentRequest shortly after the status flips.
@@ -474,14 +548,11 @@ export default function GlobalTripRequestPanel() {
       // DO NOT manually update state - WAIT for RTDB status update
     } catch (error) {
       console.error(`[v0] Error updating trip status to ${status}:`, error);
+      showActionError('Unable to update trip status. Please try again.');
     } finally {
-      if (status === 'accepted') {
-        setIsAccepting(false);
-      } else if (status === 'declined') {
-        setIsRejecting(false);
-      } else {
-        setIsActionLoading(false);
-      }
+      setIsAccepting(false);
+      setIsRejecting(false);
+      setIsActionLoading(false);
     }
   };
 
@@ -923,6 +994,7 @@ export default function GlobalTripRequestPanel() {
 
           {/* Action buttons - fixed, always visible below the scroll area */}
           <View style={styles.buttonContainer}>
+            {actionError ? <Text accessibilityRole="alert" style={styles.actionError}>{actionError}</Text> : null}
             {renderButtons()}
           </View>
         </View>
@@ -1086,6 +1158,13 @@ const styles = StyleSheet.create({
   },
   buttonContainer: {
     marginTop: 'auto',
+    marginBottom: 8,
+  },
+  actionError: {
+    color: '#C62828',
+    fontSize: 12,
+    fontWeight: '600',
+    textAlign: 'center',
     marginBottom: 8,
   },
   buttonRow: {
